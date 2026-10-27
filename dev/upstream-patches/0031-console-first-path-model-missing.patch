@@ -1,0 +1,64 @@
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index 0e5efd6..90529c4 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -1313,7 +1313,14 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 			// 不是「该账号缺这个模型」。照 ErrModelBlocked 处理，handler 会写 (账号,模型)
+ 			// 6 小时负缓存，逐个账号轮过去就是整池 503 no_healthy_account，比不换路径更糟。
+ 			// 也不按 ErrClient 处理：连败计数是账号健康信号，这里失败的是路径不是账号。
+-			if i > 0 && kind == ErrModelBlocked {
++			//
++			// 判据必须**看路径**、不能只看索引（issue #296 回归）：渠道校验记忆会把
++			// /console 排到候选首位（i == 0），此时 /console 报的 11102 会绕过 `i > 0`
++			// 守卫，被误判成 ErrModelBlocked 写 6 小时负缓存 —— 被标记过的账号每轮都
++			// 先吃这一下，后台探测把整池轮一遍就是整组「模型受限」。/console 报的
++			// 11102 与它排第几无关，一律按请求级处理；/v2 主路径上的 11102 仍是真·
++			// 账号缺模型，照旧罚。
++			if kind == ErrModelBlocked && (i > 0 || path == chatConsolePath) {
+ 				log.Printf("WARN: [upstream] chat_stream acct=%s: 回退路径 %s 报 %s，按请求级处理（不写模型冷却）",
+ 					logfmt.Label(a.UID, a.Nickname), path, kind)
+ 				kind = ErrFallbackModelMissing
+diff --git a/internal/upstream/fallback_model_missing_test.go b/internal/upstream/fallback_model_missing_test.go
+index c170a35..8215cdd 100644
+--- a/internal/upstream/fallback_model_missing_test.go
++++ b/internal/upstream/fallback_model_missing_test.go
+@@ -74,3 +74,39 @@ func TestPrimaryPathModelMissingStaysModelBlocked(t *testing.T) {
+ 		t.Fatalf("主路径的 11102 应保持 ErrModelBlocked，got %v", ue.Kind)
+ 	}
+ }
++
++// 回归（issue #296 引入）：被渠道校验记忆标记过的账号，候选顺序变成 /console 优先，
++// 于是 /console 的 11102 落在 i == 0 —— 旧的 `i > 0 && kind == ErrModelBlocked` 守卫
++// 直接漏判，把它当「该账号缺这个模型」写 6 小时负缓存，后台探测轮一遍就是整组
++// 「模型受限」。这里钉住：即便 /console 排在首位（i == 0），它的 11102 也必须归请求级。
++func TestConsoleFirstPathModelMissingStaysRequestLevel(t *testing.T) {
++	var paths []string
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		paths = append(paths, r.URL.Path)
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusBadRequest)
++		_, _ = w.Write([]byte(`{"code":11102,"msg":"model [deepseek-v4.1-flash] service info not found"}`))
++	}))
++	defer srv.Close()
++
++	c := New()
++	c.ChatBaseCN = srv.URL
++	acct := &auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}
++	// 模拟 #296：该账号被渠道校验拦过 → chatPaths 把 /console 排到首位（i == 0）。
++	c.markChannelBlocked("u1")
++	_, status, raw, err := c.ChatStream(acct,
++		[]byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`), "", ChatMeta{})
++	if status != http.StatusBadRequest {
++		t.Fatalf("status=%d body=%s", status, raw)
++	}
++	if len(paths) == 0 || !strings.Contains(paths[0], "/console/") {
++		t.Fatalf("前提：被标记的账号应 /console 优先，实际路径=%v", paths)
++	}
++	ue, ok := err.(*Error)
++	if !ok {
++		t.Fatalf("应返回分类信封，got %T (%v)", err, err)
++	}
++	if ue.Kind != ErrFallbackModelMissing {
++		t.Fatalf("/console 首位的 11102 也必须归请求级（ErrFallbackModelMissing），got %v", ue.Kind)
++	}
++}
